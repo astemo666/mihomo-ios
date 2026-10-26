@@ -1,22 +1,52 @@
 name: Checks
 
-on: [push, pull_request]
+# Lane F (2026-10-24): pushes to feat/** / fix/** / draft/** and other work branches no longer run Checks — only
+# main, test/** (the self-test branches) and core/** branches.
+# Pull requests still run, except a PR whose head is a test/** or core/** branch of this repository: the push run
+# already covers that commit (identical-SHA dedupe). Docs: CI.md.
+on:
+  push:
+    branches: [main, 'test/**', 'core/**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit / ref to check (empty = the triggering commit)
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
+# A newer push to the same test/** / core/** branch (or a newer commit on the same PR) cancels the older run;
+# main runs are never cancelled. A workflow_call run's group is keyed by the commit it checks.
+concurrency:
+  group: checks-${{ inputs.ref || (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/test/') || startsWith(github.ref, 'refs/heads/core/') }}
+
 jobs:
   term-audit:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !(startsWith(github.event.pull_request.head.ref, 'test/') || startsWith(github.event.pull_request.head.ref, 'core/')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
       - run: python3 scripts/term_audit.py
 
-  goja-diff:
+  # fix/nc-tcp0: the TUN bridge (nc_stack.c + vendored lwIP) on the host — v4/v6 TCP handshakes to real destinations,
+  # v6 UDP, UDP reply checksums (the build419 "tcp accepted 0" root causes). Seconds on ubuntu, no macOS runner.
+  nc-stack-c:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !(startsWith(github.event.pull_request.head.ref, 'test/') || startsWith(github.event.pull_request.head.ref, 'core/')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
         with:
-          go-version: "stable"
-      - run: bash scripts/goja_diff_check.sh
+          ref: ${{ inputs.ref }}
+      # nc_stack_test.c (handshake / checksums / multi-flow UDP) + nc_soak_test.c (fix/nc-tcp1: ≥800 TCP flows v4+v6
+      # and a DNS query each over ~12 simulated minutes incl. TIME_WAIT + listener expiry; fails on any SYN not
+      # accepted, any not-ours drop, any listen fail, any leaked PCB — build433's data-plane death).
+      - name: nc-stack host tests + soak
+        run: bash tools/nc-stack-test/run.sh

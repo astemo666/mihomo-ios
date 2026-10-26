@@ -1,17 +1,53 @@
 # test/selftest: self-tests without a device. Runs on pushes to test/** branches (a workflow_dispatch workflow
 # must exist on the default branch before it can be dispatched) and by workflow_dispatch with run_tests=true
-# once merged. Never releases. A commit message containing [only:<testName>] runs just that UI test ([unit:<Class>] adds a unit test class), [skip-go]
-# skips the Go job.
-# - go: go vet + the whole bridge test suite with the race detector (Linux).
+# once merged. Never releases. A commit message containing [only:<testName>] runs just that UI test ([unit:<Class>] adds a unit test class),
+# [skip-ui] skips the UI shards.
+# - plan: picks the UI path (smoke or full matrix, see "UI path" below). Ubuntu, ~20 s.
+# - (Go-zero: the former go job — go vet / go test / -race on bridge/ — is gone with bridge/.)
 # - ui: XCUITest target (project-uitests.yml) on an iOS simulator with the synthetic -UITestSeed profile,
 #   zh-Hans and en, light and dark. Screenshots and per-test reports are uploaded as artifacts only.
 # The release workflow (ios.yml) and project.yml are not touched by this file.
 # Org mirror sharding (doubles concurrent macOS runners; free plan = 5 macOS jobs per account/org):
-#   astemo6/mihomo-ios   → go + ui zh-Hans light/dark
-#   astemo666/mihomo-ios → ui en light/dark (no go)
+#   astemo6/mihomo-ios   → ui zh-Hans light/dark
+#   astemo666/mihomo-ios → ui en light/dark
 #   any other repo       → everything
 # Full matrix in one repo: workflow_dispatch shard=all, or [shard:all] in the pushed commit message.
 # scripts/selftest-split.sh pushes a test/** branch to both remotes and waits for both runs.
+# Lane F (2026-10-24, docs in CI.md):
+# - a newer push to the same test/** branch cancels the older run (concurrency below);
+# - a push whose commit already has a Self-test run on another branch of this repository (queued, running or
+#   successful) skips ui (dedupe job) — a re-run of the skipped run, or a workflow_dispatch, always runs;
+#
+# UI path (2026-10-24, maintainer rule: a release that touches no UI and no copy runs the smoke shard + unit
+# tests + the IPA build only):
+#   The plan job diffs HEAD against its base and classifies every changed file.
+#     base = merge-base(HEAD, origin/main) for test/** pushes and dispatches on a branch (the whole branch,
+#            not just the pushed commit). When that is HEAD itself (dispatch on main, or a test/** branch
+#            sitting on main = the release path) the base is the newest release tag v*-build* below HEAD.
+#            No base found → full.
+#   UI-affecting files (any one → full matrix as before):
+#     App/**            views, view models, Assets.xcassets, Localizable.xcstrings, Info.plist, Resources
+#     Shared/**         compiled into the app + widget; holds String(localized:) copy and LiveActivityViews
+#     Widget/**         widget / Live Activity UI
+#     UITests/**        the UI tests themselves
+#     project-uitests.yml  UI / unit test targets and scheme
+#     *.xcstrings *.strings *.stringsdict *.lproj/** *.xcassets/** *.storyboard *.xib  anywhere
+#     project.yml       only when a changed line mentions the app/widget UI: a path App/Shared/Widget,
+#                       xcstrings, ASSETCATALOG, INFOPLIST, PRODUCT_NAME, AppIcon, AccentColor, DisplayName
+#   Everything else (PacketTunnel/**, Geo/**, Config/**, UnitTests/**, scripts/**, .github/**,
+#   docs) is not UI-affecting → smoke.
+#   smoke = one combo, zh-Hans light (astemo6 / other repos; the astemo666 en mirror runs no UI job):
+#     SMOKE_TESTS (launch + tab/page navigation + node manager) + every MihomoUnitTests class. The app,
+#     test bundle and framework are built in full, so a compile break still fails.
+#   full  = today's matrix (repository split above; light:1/2/3 + dark:0 per language).
+# Markers / inputs (commit message of the pushed head; dispatch input `shard`):
+#   [shard:all]   / shard=all    full matrix, both languages, in this repo (wins over everything)
+#   [shard:smoke] / shard=smoke  force smoke even when UI files changed
+#   [shard:full]  / shard=full   force the full repository-split matrix even when no UI file changed
+#   (none)        / shard=auto   the diff rule above
+#   [only:<test>] / [unit:<Class>] / inputs.only  explicit selection, unchanged: light shard 1 + dark:0 as
+#                 before (smoke: runs the selection in the one smoke combo when [shard:smoke] is also given)
+#   [skip-ui]  unchanged.
 name: Self-test
 
 on:
@@ -29,15 +65,30 @@ on:
         type: string
         required: false
         default: ""
-      skip_go:
-        description: Skip the Go job
+      shard:
+        description: "auto = smoke if no UI-affecting file changed (see header), else split by repository; full = split by repository; smoke = one zh-Hans light smoke combo; all = full matrix here"
+        type: choice
+        options: [auto, full, smoke, all]
+        required: false
+        default: auto
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit / ref to test (empty = the triggering commit)
+        type: string
+        required: false
+        default: ""
+      run_tests:
         type: boolean
         required: false
-        default: false
+        default: true
+      only:
+        type: string
+        required: false
+        default: ""
       shard:
-        description: "auto = split by repository (astemo6 go+zh-Hans, astemo666 en); all = full matrix here"
-        type: choice
-        options: [auto, all]
+        description: "auto | full | smoke | all (see header)"
+        type: string
         required: false
         default: auto
 
@@ -45,89 +96,149 @@ permissions:
   contents: read
 
 concurrency:
-  group: selftest-${{ github.ref }}
+  group: selftest-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  go:
-    if: ${{ ((github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip-go]')) || (inputs.run_tests && !inputs.skip_go)) && (github.repository != 'astemo666/mihomo-ios' || inputs.shard == 'all' || contains(github.event.head_commit.message, '[shard:all]')) }}
+  # Identical-SHA dedupe (push only): the same commit pushed to a second test/** branch while its first run is
+  # queued / running / green would take another 4 macOS runners for the same result.
+  dedupe:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.find.outputs.skip }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          SKIP=false
+          if [ "${{ github.event_name }}" = push ] && [ "${{ github.run_attempt }}" = 1 ]; then
+            # Earlier runs (lower id) of this workflow for the same commit on another branch that are not
+            # cancelled / failed. Any API error leaves SKIP=false (never skip by accident).
+            OTHER=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ui-tests.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=50" \
+              --jq ".workflow_runs[] | select(.id < $GITHUB_RUN_ID and .head_branch != env.BRANCH and (.status != \"completed\" or .conclusion == \"success\")) | \"\(.id) \(.head_branch) \(.status)/\(.conclusion)\"" 2>/dev/null | head -n 1 || true)
+            if [ -n "$OTHER" ]; then
+              SKIP=true
+              read -r OID OBR OST <<< "$OTHER"
+              echo "### Self-test skipped: commit ${GITHUB_SHA::7} already has run $OID on $OBR ($OST)" >> "$GITHUB_STEP_SUMMARY"
+              echo "- $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$OID — re-run this run to test it here anyway" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "skip=$SKIP" | tee -a "$GITHUB_OUTPUT"
+  plan:
+    # Picks the UI path: smoke (one combo) when the branch changes no UI-affecting file, else the full matrix.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      combos: ${{ steps.plan.outputs.combos }}
+      mode: ${{ steps.plan.outputs.mode }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
         with:
-          go-version-file: bridge/go.mod
-          cache-dependency-path: bridge/go.sum
-      - name: go vet
-        working-directory: bridge
-        run: go vet ./... 2>&1 | tee ../go-vet.log
-      # 1) The suite without the race detector; tests that fail are retried once on their own (several
-      #    download geo data / reach public endpoints and flake on the runner's network).
-      - name: go test
-        if: always()
-        working-directory: bridge
+          ref: ${{ inputs.ref }}
+          # Whole history without blobs: enough for merge-base / tags / name-only diffs (blobs fetched on demand).
+          fetch-depth: 0
+          filter: blob:none
+      - name: Plan
+        id: plan
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          SHARD_INPUT: ${{ inputs.shard }}
+          ONLY_INPUT: ${{ inputs.only }}
+          REPO: ${{ github.repository }}
         run: |
-          set +e
-          go test -count=1 -timeout 30m ./... 2>&1 | tee ../go-test.log
-          RC=${PIPESTATUS[0]}
-          [ "$RC" = 0 ] && exit 0
-          FAILED=$(grep -E "^--- FAIL: " ../go-test.log | awk '{print $3}' | sort -u | paste -sd'|' -)
-          echo "failed first run: $FAILED"
-          [ -n "$FAILED" ] || exit "$RC"
-          go test -count=1 -timeout 15m -run "^(${FAILED})\$" ./... 2>&1 | tee ../go-test-retry.log
-          RC2=${PIPESTATUS[0]}
-          echo "### go test" >> "$GITHUB_STEP_SUMMARY"
-          echo "- first run failed: ${FAILED//|/, }; retry exit $RC2" >> "$GITHUB_STEP_SUMMARY"
-          exit "$RC2"
-      # 1b) v0.18: tests that need the real Tailscale outbound (tsnet + gVisor), built with the app's tag.
-      - name: go test (with_gvisor)
-        if: always()
-        working-directory: bridge
-        run: go test -tags with_gvisor -count=1 -timeout 10m -run 'TestV018' . 2>&1 | tee ../go-test-gvisor.log
-      # 2) The race detector; reports are classified (scripts/race_check.py): races in this repository's
-      #    code fail, races inside mihomo's config re-apply are listed as upstream.
-      - name: go test -race
-        if: always()
-        working-directory: bridge
-        run: |
-          set +e
-          go test -race -count=1 -timeout 30m ./... > ../go-test-race.log 2>&1
-          RC=$?
-          echo "go test -race exit $RC (failures from upstream races are expected)"
-          grep -E "^(--- FAIL|ok |FAIL)" ../go-test-race.log | head -n 80
-          # r7 R7A-12: the exit code counts too — only failures explained by upstream race reports pass.
-          python3 ../scripts/race_check.py ../go-test-race.log --summary "$GITHUB_STEP_SUMMARY" --exit-code "$RC"
-      - name: Failed tests (on failure)
-        if: failure()
-        run: |
-          grep -E "^(--- FAIL|FAIL|panic:)" -A12 go-test.log go-test-retry.log 2>/dev/null | head -n 300 || true
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: go-test-logs
-          path: |
-            go-vet.log
-            go-test.log
-            go-test-retry.log
-            go-test-race.log
-            go-test-gvisor.log
-          if-no-files-found: warn
-          retention-days: 14
+          set -uo pipefail
+          FORCE=""
+          case "${SHARD_INPUT:-}" in all|smoke|full) FORCE="$SHARD_INPUT" ;; esac
+          if [ -z "$FORCE" ]; then
+            if printf '%s' "$COMMIT_MSG" | grep -qF '[shard:all]'; then FORCE=all
+            elif printf '%s' "$COMMIT_MSG" | grep -qF '[shard:smoke]'; then FORCE=smoke
+            elif printf '%s' "$COMMIT_MSG" | grep -qF '[shard:full]'; then FORCE=full
+            fi
+          fi
+          SELECTION=0
+          if [ -n "${ONLY_INPUT:-}" ] || printf '%s' "$COMMIT_MSG" | grep -qE '\[(only|unit):[A-Za-z0-9_]+\]'; then SELECTION=1; fi
+          BASE=""; BASE_DESC=""; UI_FILES=""; NCHANGED=0
+          if [ -n "$FORCE" ]; then
+            MODE=$FORCE; REASON="forced ($FORCE)"
+          elif [ "$SELECTION" = 1 ]; then
+            MODE=full; REASON="explicit [only:]/[unit:] selection (unchanged behaviour)"
+          else
+            MB=$(git merge-base HEAD origin/main 2>/dev/null || true)
+            HEADSHA=$(git rev-parse HEAD)
+            if [ -n "$MB" ] && [ "$MB" != "$HEADSHA" ]; then
+              BASE=$MB; BASE_DESC="merge-base with origin/main"
+            else
+              TAG=$(git describe --tags --abbrev=0 --match 'v*-build*' HEAD 2>/dev/null || true)
+              if [ -n "$TAG" ]; then BASE=$(git rev-list -n1 "$TAG"); BASE_DESC="last release tag $TAG"; fi
+            fi
+            if [ -z "$BASE" ]; then
+              MODE=full; REASON="no diff base found"
+            elif ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+              MODE=full; REASON="git diff failed"
+            else
+              NCHANGED=$(printf '%s\n' "$CHANGED" | grep -c . || true)
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                ui=0
+                case "$f" in
+                  App/*|Shared/*|Widget/*|UITests/*|project-uitests.yml) ui=1 ;;
+                  *.xcstrings|*.strings|*.stringsdict|*.storyboard|*.xib|*.lproj/*|*.xcassets/*) ui=1 ;;
+                  project.yml)
+                    if git diff "$BASE" HEAD -- project.yml | grep -E '^[+-][^+-]' \
+                      | grep -qE 'path: *(App|Shared|Widget)|xcstrings|ASSETCATALOG|INFOPLIST|PRODUCT_NAME|AppIcon|AccentColor|DisplayName'; then ui=1; fi ;;
+                esac
+                [ "$ui" = 1 ] && UI_FILES="$UI_FILES$f"$'\n'
+              done <<< "$CHANGED"
+              if [ -n "$UI_FILES" ]; then MODE=full; REASON="UI-affecting files changed"; else MODE=smoke; REASON="no UI-affecting file changed"; fi
+            fi
+          fi
+          ALL='["zh-Hans:light:1","zh-Hans:light:2","zh-Hans:light:3","en:light:1","en:light:2","en:light:3","zh-Hans:dark:0","en:dark:0"]'
+          case "$MODE" in
+            all) COMBOS=$ALL ;;
+            smoke) if [ "$REPO" = astemo666/mihomo-ios ]; then COMBOS='[]'; else COMBOS='["zh-Hans:light:smoke"]'; fi ;;
+            *) case "$REPO" in
+                 astemo666/mihomo-ios) COMBOS='["en:light:1","en:light:2","en:light:3","en:dark:0"]' ;;
+                 astemo6/mihomo-ios) COMBOS='["zh-Hans:light:1","zh-Hans:light:2","zh-Hans:light:3","zh-Hans:dark:0"]' ;;
+                 *) COMBOS=$ALL ;;
+               esac ;;
+          esac
+          echo "mode=$MODE ($REASON) base=${BASE:-none} ${BASE_DESC} changed=$NCHANGED combos=$COMBOS"
+          { echo "mode=$MODE"; echo "combos=$COMBOS"; } >> "$GITHUB_OUTPUT"
+          {
+            echo "### UI path: $MODE"
+            echo "- reason: $REASON"
+            [ -n "$BASE" ] && echo "- base: \`${BASE:0:12}\` ($BASE_DESC), $NCHANGED changed file(s)"
+            echo "- combos: \`$COMBOS\`"
+            if [ -n "$UI_FILES" ]; then
+              echo "- UI-affecting files:"
+              printf '%s' "$UI_FILES" | head -n 30 | sed 's/^/  - /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   ui:
-    if: ${{ github.event_name == 'push' || inputs.run_tests }}
+    # [skip-ui] in the pushed commit message: the macOS UI shards are not run.
+    # The plan job's combos are [] when nothing runs here (smoke on the astemo666 en mirror).
+    needs: [dedupe, plan]
+    if: ${{ needs.dedupe.outputs.skip != 'true' && ((github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip-ui]')) || inputs.run_tests) && needs.plan.outputs.combos != '[]' }}
     runs-on: macos-15
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # Shard by repository (see header). Full list when shard=all, [shard:all], or an unknown repository.
+        # Full path: shard by repository (see header); full list when shard=all, [shard:all], or an unknown repository.
         # Review 6 OPT-1: light is split in two test shards (:1 = test01–test30 since r7, :2 = the rest + unit tests, so new
         # tests land there automatically) — one light job took 72–80 min of the 120 min limit, now ~45 min each.
-        combo: ${{ fromJSON(((inputs.shard == 'all' || contains(github.event.head_commit.message, '[shard:all]')) && '["zh-Hans:light:1","zh-Hans:light:2","en:light:1","en:light:2","zh-Hans:dark:0","en:dark:0"]') || (github.repository == 'astemo666/mihomo-ios' && '["en:light:1","en:light:2","en:dark:0"]') || (github.repository == 'astemo6/mihomo-ios' && '["zh-Hans:light:1","zh-Hans:light:2","zh-Hans:dark:0"]') || '["zh-Hans:light:1","zh-Hans:light:2","en:light:1","en:light:2","zh-Hans:dark:0","en:dark:0"]') }}
+        # From the plan job: smoke = ["zh-Hans:light:smoke"]; full = the repository split; all = all 8 combos.
+        combo: ${{ fromJSON(needs.plan.outputs.combos) }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
       - name: Combo
         run: |
           combo="${{ matrix.combo }}"
@@ -142,45 +253,17 @@ jobs:
           ONLY_INPUT: ${{ inputs.only }}
         run: |
           SKIP=0
-          if [ "$SHARD" = 2 ] && { [ -n "$ONLY_INPUT" ] || printf '%s' "$COMMIT_MSG" | grep -qE '\[(only|unit):[A-Za-z0-9_]+\]'; }; then
+          if { [ "$SHARD" = 2 ] || [ "$SHARD" = 3 ]; } && { [ -n "$ONLY_INPUT" ] || printf '%s' "$COMMIT_MSG" | grep -qE '\[(only|unit):[A-Za-z0-9_]+\]'; }; then
             SKIP=1
             echo "only-testing selection runs in light shard 1; this shard skips build and tests"
           fi
           echo "SKIP_SHARD=$SKIP" >> "$GITHUB_ENV"
-      - name: Core version
-        if: env.SKIP_SHARD != '1'
-        run: echo "MIHOMO_VERSION=$(awk '$1=="github.com/metacubex/mihomo"{print $2; exit}' bridge/go.mod)" >> "$GITHUB_ENV"
       - name: Select latest Xcode
         if: env.SKIP_SHARD != '1'
         run: |
           XC=$(ls -d /Applications/Xcode_*.app | sed -E 's/.*Xcode_([0-9.]+)\.app/\1 &/' | grep -v -i beta | sort -V | tail -n1 | cut -d' ' -f2)
           sudo xcode-select -s "$XC/Contents/Developer"
           xcodebuild -version
-      - uses: actions/setup-go@v6
-        if: env.SKIP_SHARD != '1'
-        with:
-          go-version-file: bridge/go.mod
-          cache-dependency-path: bridge/go.sum
-      - name: Cache simulator Libmihomo
-        id: simfw
-        if: env.SKIP_SHARD != '1'
-        uses: actions/cache@v5
-        with:
-          path: Frameworks/Libmihomo.xcframework
-          key: libmihomo-sim-${{ env.MIHOMO_VERSION }}-${{ hashFiles('bridge/**') }}
-      - name: Build Libmihomo.xcframework (simulator)
-        if: env.SKIP_SHARD != '1' && steps.simfw.outputs.cache-hit != 'true'
-        working-directory: bridge
-        run: |
-          set -euo pipefail
-          MOBILE_VER=$(go list -m -f '{{.Version}}' golang.org/x/mobile)
-          go install golang.org/x/mobile/cmd/gomobile@"$MOBILE_VER" golang.org/x/mobile/cmd/gobind@"$MOBILE_VER"
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          gomobile init
-          mkdir -p ../Frameworks
-          gomobile bind -target=iossimulator/arm64 -iosversion=15.0 -tags with_gvisor -trimpath \
-            -ldflags "-s -w -X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION} -X github.com/astemo6/mihomo-ios/bridge.CoreVersion=${MIHOMO_VERSION}" \
-            -o ../Frameworks/Libmihomo.xcframework .
       - name: Generate project (with UI tests)
         if: env.SKIP_SHARD != '1'
         run: |
@@ -237,23 +320,37 @@ jobs:
           # r7 (review7 R7A-9): test22–test30 (~8 min) moved to shard 1 — shard 2 had grown to ~61 min of tests with
           # test56–test70 (39596801011: light:1 34.9 min, light:2 60.8 min).
           SHARD1_TESTS="test01_TabsAndHome test02_HomePolicyPicker test03_MoreEveryPage test04_NodeManager test05_AddNodeAndEditor test06a_ImportQX test06b_ImportSurge test06c_ImportClash test06d_ImportLoon test06e_ImportLinks test07_Editors test08_ModulesAndPanels test09_AutoApplySettings test10_ProfileNodeEdit test11_RegionFilters test12_FilterSources test13_RuleChips test14_DNSLog test15_AllRewrites test16_PolicyModeControl test17_RequestsSummary test18_SSIDPermissions test19_RequestTimeline test20_NodeSettings test21_TileEditing test22_TailscaleNode test23_DiagnosticsMemory test24_SampleProfile test25_OverrideScripts test26_HomeTiles test27_LANDetail test28_WebDAV test29_UnlockServices test30_SettingsToggles"
+          # 2026-10-23: light shard 2 had grown to ~63 min of UI tests; test31–test58 (~28 min) run in shard 3 in
+          # parallel (4 macOS jobs per repo, free plan allows 5). Shard 2 keeps the rest + the unit tests.
+          SHARD3_TESTS="test31_GroupOrder test32_RouteEditorSlash test33_RulesAndRewriteAddDelete test34_URLSchemeLinks test35_NodeEditUndo test36_LanguagesNoLeftovers test37_SettingsPersistAcrossRelaunch test38_ProfileSwitch test39_BigProfileResponsive test40_FilterRenameAndIcon test42_GroupReorderBothWays test43_ModeGlobalVisibility test44_HomeUnlockTileAndScriptTasks test45_RuleFormDefaults test46_LogsNotEmptyOnFirstOpen test47_SnapshotMultiDelete test49_SurgeUIShots test50_HomeExitSubtitle test51_PolicyChainShots test56_ProfileSubscriptionSwipe test57_GroupLongPressMenu test58_SubsSplitProviderActions"
           FAILED=""
           SEL=("${ONLY[@]}")
-          if [ ${#SEL[@]} -gt 0 ] && [ "$SHARD" = 2 ]; then
+          if [ ${#SEL[@]} -gt 0 ] && { [ "$SHARD" = 2 ] || [ "$SHARD" = 3 ]; }; then
             # An explicit [only:] / inputs.only selection runs once, in shard 1.
             echo "only-testing selection runs in light shard 1; nothing to do here"
             echo "FAILED=" >> "$GITHUB_ENV"
             exit 0
           fi
           if [ ${#SEL[@]} -eq 0 ] && [ "$STYLE" = dark ]; then SEL=("${DARK_ONLY[@]}"); fi
+          # Smoke path (no UI-affecting change, see header): launch + navigation UI tests and every unit test class.
+          SMOKE_TESTS="test01_TabsAndHome test03_MoreEveryPage test04_NodeManager"
+          if [ ${#SEL[@]} -eq 0 ] && [ "$SHARD" = smoke ]; then
+            for t in $SMOKE_TESTS; do SEL+=(-only-testing:"MihomoUITests/MihomoUITests/$t"); done
+            SEL+=(-only-testing:MihomoUnitTests)
+          fi
           if [ ${#SEL[@]} -eq 0 ] && [ "$SHARD" = 1 ]; then
             for t in $SHARD1_TESTS; do SEL+=(-only-testing:"MihomoUITests/MihomoUITests/$t"); done
           fi
           if [ ${#SEL[@]} -eq 0 ] && [ "$SHARD" = 2 ]; then
-            for t in $SHARD1_TESTS; do SEL+=(-skip-testing:"MihomoUITests/MihomoUITests/$t"); done
+            for t in $SHARD1_TESTS $SHARD3_TESTS; do SEL+=(-skip-testing:"MihomoUITests/MihomoUITests/$t"); done
+          fi
+          if [ ${#SEL[@]} -eq 0 ] && [ "$SHARD" = 3 ]; then
+            for t in $SHARD3_TESTS; do SEL+=(-only-testing:"MihomoUITests/MihomoUITests/$t"); done
           fi
           xcrun simctl ui "$DEV" appearance "$STYLE" || true
-          TEST_RUNNER_UI_LANG="$LANG_" TEST_RUNNER_UI_STYLE="$STYLE" TEST_RUNNER_UI_SHOT_DIR="$PWD/shots" \
+          # feat/jsc-engine: JavaScriptCore without JIT in the test host, as on a device (no JIT for apps and
+          # extensions). Round 2 (8e86e33): with JIT the busy-loop case was never terminated by the time limit.
+          TEST_RUNNER_UI_LANG="$LANG_" TEST_RUNNER_UI_STYLE="$STYLE" TEST_RUNNER_UI_SHOT_DIR="$PWD/shots" TEST_RUNNER_JSC_useJIT=false \
           xcodebuild -project Mihomo.xcodeproj -scheme MihomoUITests -configuration Debug -sdk iphonesimulator \
             -destination "id=$DEV" -derivedDataPath build/uit -resultBundlePath "results/$SHORT.xcresult" \
             "${SEL[@]}" test-without-building 2>&1 | tee "results/$SHORT.log" | grep -E "Test Case|error:|failed|passed|XCTAssert|issue"
